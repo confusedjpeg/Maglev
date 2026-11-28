@@ -150,7 +150,7 @@ jobs:
                 if ! git merge-base --is-ancestor "$sha" "$GITHUB_SHA" 2>/dev/null; then
                   continue
                 fi
-                if ! git diff --quiet "$sha" "$GITHUB_SHA" -- . ':(exclude)**/*.md' ':(exclude)docs/**' ':(exclude)screens/**' ':(exclude)LICENSE' 2>/dev/null; then
+                if ! git diff --quiet "$sha" "$GITHUB_SHA" -- . ':(exclude)**/*.md' ':(exclude)docs/**' ':(exclude)screens/**' ':(exclude)LICENSE' 2>/dev/null; then  # private-ref-ok: this pathspec skips docs-only changes and reads nothing from docs/
                   echo "skipping ancestor run $r ($sha): non-docs files changed since $sha" >> "$ERR_LOG"
                   continue
                 fi
