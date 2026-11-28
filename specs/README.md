@@ -49,4 +49,5 @@ Start from [`_template/`](_template/). It is a working model, so `npm run models
 | [`service-restart/`](service-restart/) | How the foreground service, `EngineHost` and `RestartPolicy` behave across process death, **Shut down**, **Pause all**, **Resume all**, and schedule holds. |
 | [`transfer-rules/`](transfer-rules/) | How governance rule tags (Wi-Fi, VPN, battery, schedule, storage) pause and resume transfers alongside user pauses and "Resume anyway". |
 | [`torrents/`](torrents/) | How Rust's scheduler assigns download and seed slots, parks finished torrents, enforces seed limits and file-health tags, and skips moving torrents. |
+| [`download-timing/`](download-timing/) | How the detail row and Timing sheet agree for transfers that finish in under a second, in seconds, or in hours. |
 | [`_template/`](_template/) | Pausable downloads. The example to copy, with one design that passes and one that was rejected. |

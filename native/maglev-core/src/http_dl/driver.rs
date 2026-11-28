@@ -137,7 +137,7 @@ pub struct DownloadOptions {
     pub down_limit_bps: Option<u64>,
     /// Allow the typed host to resolve onto the local network (after `LAN_ADDRESS`).
     pub allow_lan: bool,
-    /// The page the link was found on (in-app browser). Kept as `page_url` on the record (contract "Auto-refresh").
+    /// The page the link was found on (in-app browser). Kept as `page_url` on the record.
     pub page_url: Option<String>,
     /// Save an HLS or DASH stream: which variant and audio track.
     pub stream: Option<StreamSpec>,
@@ -1106,7 +1106,7 @@ enum ProbeFail {
     Auth(u16),
     /// 403 with no sign-in details: the site refused the link.
     Refused(u16),
-    Status(u16),
+    Status(u16, Option<Duration>),
     Html,
     LocalRedirect,
     /// The playlist can't be saved.
@@ -2128,7 +2128,7 @@ impl Downloads {
                 self.update(&id, |r, _| r.status = Some(s));
                 self.dispatch(&id, Event::ProbeAuth);
             }
-            Err(ProbeFail::Status(s)) => {
+            Err(ProbeFail::Status(s, _)) => {
                 self.update(&id, |r, _| r.status = Some(s));
                 self.dispatch(&id, Event::ProbeStatus);
             }
@@ -2215,7 +2215,7 @@ impl Downloads {
                     self.dispatch(&id, Event::Auth);
                     return;
                 }
-                Err(ProbeFail::Status(s)) => {
+                Err(ProbeFail::Status(s, _)) => {
                     self.update(&id, |r, _| r.status = Some(s));
                     self.dispatch(&id, Event::HttpFatal);
                     return;
@@ -2892,7 +2892,7 @@ async fn probe_request(
         }
         ProbeVerdict::Auth => Err(ProbeFail::Auth(status)),
         ProbeVerdict::Refused => Err(with_link_login(ProbeFail::Refused(status), auth.is_some())),
-        ProbeVerdict::Status(s) => Err(ProbeFail::Status(s)),
+        ProbeVerdict::Status(s) => Err(ProbeFail::Status(s, None)),
         ProbeVerdict::Html => Err(ProbeFail::Html),
     }
 }
@@ -2984,7 +2984,7 @@ fn probe_error(f: ProbeFail) -> EngineError {
             e.http_status = Some(s);
             e
         }
-        ProbeFail::Status(s) => EngineError::http_status(
+        ProbeFail::Status(s, _) => EngineError::http_status(
             s,
             if s == 404 || s == 410 {
                 "The file isn't there (404).".to_string()
