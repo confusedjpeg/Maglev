@@ -164,6 +164,18 @@ function best(list: Cand[]): Cand | null {
   return top;
 }
 
+/** Lowest known bitrate wins. Formats with no bitrate are skipped, since they can't be compared. */
+function smallest(list: Cand[]): Cand | null {
+  let low: Cand | null = null;
+  for (const c of list) {
+    if (quality(c) > 0 && (!low || quality(c) < quality(low))) low = c;
+  }
+  return low;
+}
+
+/** 144p and 240p get the small sound track; see `buildVideoSiteInfo`. */
+const SMALL_SOUND_MAX_HEIGHT = 240;
+
 function part(f: RawFormat): VideoSitePart {
   return { url: f.url as string, headers: { ...(f.http_headers ?? {}) }, size: num(f.filesize) };
 }
@@ -213,7 +225,14 @@ export function buildVideoSiteInfo(raw: unknown): VideoSiteInfo {
   // Prefer stereo/mono over multi-channel surround (e.g. YouTube 5.1 formats 256/258, two to three times the
   // stereo size) so low qualities don't carry a surround audio track bigger than a higher muxed quality.
   const stereoAudio = audioCands.filter((c) => (num(c.fmt.audio_channels) ?? 2) <= 2);
-  const audio = best(stereoAudio.length > 0 ? stereoAudio : audioCands);
+  const audioPool = stereoAudio.length > 0 ? stereoAudio : audioCands;
+  const audio = best(audioPool);
+  // People pick 144p or 240p to save data, and there the sound is most of the file: YouTube's 128 kbps track is
+  // about twice the size of a 144p picture. Those qualities get the smallest track when it is clearly smaller
+  // (YouTube's 48 kbps one). 360p and up keep the normal track, and so does Audio only, which is the row for
+  // people who want the sound.
+  const lowest = smallest(audioPool);
+  const smallAudio = audio && lowest && quality(lowest) <= quality(audio) * 0.75 ? lowest : audio;
   const videos = all.filter((c) => kindOf(c.fmt) === 'video' && c.fmt.ext === 'mp4' && /^avc[13]/.test(c.fmt.vcodec ?? '') && shortEdge(c.fmt));
   const singles = all.filter((c) => kindOf(c.fmt) === 'single' && (c.fmt.ext === 'mp4' || c.fmt.ext === 'm4v'));
 
@@ -241,18 +260,19 @@ export function buildVideoSiteInfo(raw: unknown): VideoSiteInfo {
         audio: null,
       });
     } else if (video && audio) {
+      const sound = h !== null && h <= SMALL_SOUND_MAX_HEIGHT && smallAudio ? smallAudio : audio;
       const v = sizeOf(video.fmt);
-      const a = sizeOf(audio.fmt);
+      const a = sizeOf(sound.fmt);
       const est = v !== null && a !== null ? v + a : null;
       options.push({
-        id: `${video.fmt.format_id ?? video.index}+${audio.fmt.format_id ?? audio.index}`,
+        id: `${video.fmt.format_id ?? video.index}+${sound.fmt.format_id ?? sound.index}`,
         label: labelFor(prefix, est),
         height: h,
         audioOnly: false,
         ext: 'mp4',
         estBytes: est,
         video: part(video.fmt),
-        audio: part(audio.fmt),
+        audio: part(sound.fmt),
       });
     }
   }
