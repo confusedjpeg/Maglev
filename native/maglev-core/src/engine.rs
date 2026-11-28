@@ -1755,6 +1755,7 @@ impl MaglevEngine {
                     // A pause by the user ends "Resume anyway".
                     m.allowed_anyway = false;
                     m.allowed_anyway_seeding = false;
+                    m.user_gen = m.user_gen.wrapping_add(1);
                 })
                 .is_some();
             if !found {
@@ -1846,6 +1847,7 @@ impl MaglevEngine {
                     m.last_error = None;
                     // Released into the queue; the planner decides whether it starts now.
                     m.queued = true;
+                    m.user_gen = m.user_gen.wrapping_add(1);
                 })
                 .is_some();
             if !found {
@@ -3097,49 +3099,65 @@ impl MaglevEngine {
         }
     }
 
-    async fn apply_action(&self, a: Action, by_id: &HashMap<String, Handle20>) {
-        match a {
-            Action::Pause { id, reason } => {
+    async fn apply_action(
+        &self,
+        a: Action,
+        by_id: &HashMap<String, Handle20>,
+        snap_gen: &HashMap<String, u64>,
+    ) {
+        let id = a.id().to_string();
+        let expected = snap_gen.get(&id).copied().unwrap_or(0);
+        match &a {
+            Action::Pause { .. } | Action::Queue { .. } | Action::Park { .. } => {
+                let mut applied = false;
                 self.meta.lock().update(&id, |m| {
-                    m.paused_by = Some(reason);
-                    m.queued = false;
+                    applied = apply_meta_action(m, expected, &a);
                 });
+                if !applied {
+                    return;
+                }
                 if let Some(h) = by_id.get(&id) {
                     self.ensure_paused(h).await;
                 }
             }
-            Action::Queue { id } => {
-                self.meta.lock().update(&id, |m| {
-                    m.paused_by = None;
-                    m.queued = true;
-                });
+            Action::Resume { .. } => {
                 if let Some(h) = by_id.get(&id) {
-                    self.ensure_paused(h).await;
-                }
-            }
-            Action::Park { id } => {
-                self.meta.lock().update(&id, |m| {
-                    m.paused_by = None;
-                    m.queued = false;
-                });
-                if let Some(h) = by_id.get(&id) {
-                    self.ensure_paused(h).await;
-                }
-            }
-            Action::Resume { id } => {
-                if let Some(h) = by_id.get(&id) {
+                    let stale = self
+                        .meta
+                        .lock()
+                        .get(&id)
+                        .map(|m| m.user_gen != expected)
+                        .unwrap_or(true);
+                    if stale {
+                        return;
+                    }
                     if let Some(err) = self.files_missing(&id, h) {
                         self.meta.lock().update(&id, |m| {
-                            m.last_error = Some(err);
-                            m.queued = false;
+                            if m.user_gen == expected {
+                                m.last_error = Some(err);
+                                m.queued = false;
+                            }
                         });
                         return;
                     }
+                    let mut applied = false;
                     self.meta.lock().update(&id, |m| {
-                        m.paused_by = None;
-                        m.queued = false;
+                        applied = apply_meta_action(m, expected, &a);
                     });
+                    if !applied {
+                        return;
+                    }
                     self.ensure_running(&id, h).await;
+                    // If the user paused while ensure_running was awaited, put librqbit back to paused immediately.
+                    let user_paused_now = self
+                        .meta
+                        .lock()
+                        .get(&id)
+                        .map(|m| m.user_gen != expected && m.paused_by.as_deref() == Some(PAUSED_BY_USER))
+                        .unwrap_or(false);
+                    if user_paused_now {
+                        self.ensure_paused(h).await;
+                    }
                 }
             }
         }
@@ -3165,6 +3183,7 @@ impl MaglevEngine {
         self.downloads.account(elapsed, metered);
         let mut facts: Vec<TorrentFacts> = Vec::with_capacity(handles.len());
         let mut by_id: HashMap<String, Handle20> = HashMap::with_capacity(handles.len());
+        let mut snap_gen: HashMap<String, u64> = HashMap::with_capacity(handles.len());
         // Torrents being moved are not startable, not counted against the queue and never touched.
         let moving: HashSet<String> = self.moves.lock().keys().cloned().collect();
         // Finished torrents with no file snapshot yet and magnets that gave up.
@@ -3308,6 +3327,7 @@ impl MaglevEngine {
                     health: m.health.clone(),
                     exempt: m.allowed_anyway,
                 });
+                snap_gen.insert(id.clone(), m.user_gen);
                 if *m != before {
                     changed = true;
                 }
@@ -3369,7 +3389,7 @@ impl MaglevEngine {
         let actions = plan(&facts, &cfg.scheduler(), &torrent_blocked(&blocked));
         let structural = !actions.is_empty() || !gave_up.is_empty();
         for a in actions {
-            self.apply_action(a, &by_id).await;
+            self.apply_action(a, &by_id, &snap_gen).await;
         }
         for id in &to_unsnapshot {
             self.forget_file_snapshot(id);
@@ -4120,4 +4140,59 @@ mod tests {
         assert_eq!(nonzero_bps(1000).unwrap().get(), 1000);
         assert_eq!(nonzero_bps(u64::MAX).unwrap().get(), u32::MAX);
     }
+
+    #[test]
+    fn apply_meta_action_skips_when_user_gen_changed() {
+        let mut m = TorrentMeta::default();
+        m.paused_by = Some(PAUSED_BY_USER.to_string());
+        m.user_gen = 2;
+        // Stale snapshot (gen 1) must not relabel a user pause as wifi_only or resume it.
+        assert!(!apply_meta_action(
+            &mut m,
+            1,
+            &Action::Pause { id: "a".into(), reason: "wifi_only".into() }
+        ));
+        assert_eq!(m.paused_by.as_deref(), Some(PAUSED_BY_USER));
+        assert!(!apply_meta_action(&mut m, 1, &Action::Resume { id: "a".into() }));
+        assert_eq!(m.paused_by.as_deref(), Some(PAUSED_BY_USER));
+        assert!(!apply_meta_action(&mut m, 1, &Action::Queue { id: "a".into() }));
+        assert!(!m.queued);
+        assert!(!apply_meta_action(&mut m, 1, &Action::Park { id: "a".into() }));
+        assert_eq!(m.paused_by.as_deref(), Some(PAUSED_BY_USER));
+
+        // Matching generation applies cleanly.
+        assert!(apply_meta_action(&mut m, 2, &Action::Queue { id: "a".into() }));
+        assert_eq!(m.paused_by, None);
+        assert!(m.queued);
+        assert!(apply_meta_action(
+            &mut m,
+            2,
+            &Action::Pause { id: "a".into(), reason: "wifi_only".into() }
+        ));
+        assert_eq!(m.paused_by.as_deref(), Some("wifi_only"));
+        assert!(!m.queued);
+    }
+}
+
+/// Applies a scheduler action to a torrent's metadata only if no user pause/resume bumped `user_gen`
+/// since the tick took its snapshot. Returns true if applied.
+fn apply_meta_action(m: &mut TorrentMeta, expected_gen: u64, a: &Action) -> bool {
+    if m.user_gen != expected_gen {
+        return false;
+    }
+    match a {
+        Action::Pause { reason, .. } => {
+            m.paused_by = Some(reason.clone());
+            m.queued = false;
+        }
+        Action::Queue { .. } => {
+            m.paused_by = None;
+            m.queued = true;
+        }
+        Action::Park { .. } | Action::Resume { .. } => {
+            m.paused_by = None;
+            m.queued = false;
+        }
+    }
+    true
 }

@@ -2,15 +2,16 @@
 (* Models how governance rules hold and release a transfer across Kotlin and Rust:
      - EngineHost.kt (evaluateGovernance, startup hold, active blocks)
      - scheduler.rs (EXEMPTABLE_TAGS, tag_blocks, plan)
-     - engine.rs (pause, resume, resume_anyway, set_transfers_allowed, finish tick)
+     - engine.rs (pause, resume, resume_anyway, tick plan + apply with user_gen guard)
 
    Rules are plain strings pushed by Kotlin into Rust's `blocked` set. Some rules
    can be overridden per transfer ("Resume anyway"), safety and physical rules
    never can, `seed_metered` applies only while seeding, `storage_full` applies
-   only while downloading, and a user pause always wins over rule changes. *)
+   only while downloading, and a user pause always wins over rule changes — even
+   when it lands between a tick's plan() snapshot and apply_action() (issue #276). *)
 
 CONSTANTS
-  DESIGN  \* "shipped", "overrideBypassesAll", "overrideLeaksToSeeding", or "userPauseOverwritten"
+  DESIGN  \* "shipped", "overrideBypassesAll", "overrideLeaksToSeeding", "userPauseOverwritten", or "noGenGuard"
 
 Exemptable    == {"wifi_only", "battery", "schedule", "seed_metered"}
 NonExemptable == {"vpn_required", "storage_full", "startup"}
@@ -23,9 +24,12 @@ VARIABLES
   pausedBy,             \* persisted meta.paused_by: "none", "user", or a tag in AllBlocks
   allowedAnyway,        \* persisted meta.allowed_anyway ("Resume anyway")
   allowedAnywaySeeding, \* persisted meta.allowed_anyway_seeding (override granted while already seeding)
-  blocks                \* active governance tags in Rust's Engine.blocked
+  blocks,               \* active governance tags in Rust's Engine.blocked
+  plannedAction,        \* pending tick action: "none", "resume", or a tag in AllBlocks (Pause)
+  planStale             \* TRUE if user_gen was bumped after TickPlan took its snapshot
 
-vars == <<phase, running, userPaused, pausedBy, allowedAnyway, allowedAnywaySeeding, blocks>>
+vars == <<phase, running, userPaused, pausedBy, allowedAnyway, allowedAnywaySeeding,
+          blocks, plannedAction, planStale>>
 
 TypeOK ==
   /\ phase \in {"downloading", "seeding"}
@@ -35,6 +39,8 @@ TypeOK ==
   /\ allowedAnyway \in BOOLEAN
   /\ allowedAnywaySeeding \in BOOLEAN
   /\ blocks \subseteq AllBlocks
+  /\ plannedAction \in ({"none", "resume"} \cup AllBlocks)
+  /\ planStale \in BOOLEAN
 
 \* Exact Rust tag_blocks(tag, facts) logic from scheduler.rs.
 TagBlocks(tag, ph, exempt) ==
@@ -61,6 +67,13 @@ Reconcile(curPausedBy, bset, ph, exempt) ==
        ELSE
          [run |-> TRUE, by |-> "none"]
 
+\* What Action::Pause / Action::Resume plan() emits for the current state (or "none" if no change).
+PlannedOf(curRun, curPausedBy, bset, ph, exempt) ==
+  LET res == Reconcile(curPausedBy, bset, ph, exempt)
+  IN IF res.run = curRun /\ res.by = curPausedBy THEN "none"
+     ELSE IF res.run THEN "resume"
+     ELSE res.by
+
 Init ==
   /\ phase = "downloading"
   /\ running = TRUE
@@ -69,29 +82,63 @@ Init ==
   /\ allowedAnyway = FALSE
   /\ allowedAnywaySeeding = FALSE
   /\ blocks = {}
+  /\ plannedAction = "none"
+  /\ planStale = FALSE
+
+\* Step 1 of Engine::tick(): snapshot facts + user_gen and compute plan().
+TickPlan ==
+  /\ plannedAction = "none"
+  /\ LET act == PlannedOf(running, pausedBy, blocks, phase, allowedAnyway)
+     IN /\ act /= "none"
+        /\ plannedAction' = act
+        /\ planStale' = FALSE
+  /\ UNCHANGED <<phase, running, userPaused, pausedBy, allowedAnyway, allowedAnywaySeeding, blocks>>
+
+\* Step 2 of Engine::tick(): apply_action checks user_gen == snap_gen (skipped in "noGenGuard").
+TickApply ==
+  /\ plannedAction /= "none"
+  /\ IF DESIGN /= "noGenGuard" /\ planStale THEN
+       /\ plannedAction' = "none"
+       /\ planStale' = FALSE
+       /\ UNCHANGED <<phase, running, userPaused, pausedBy, allowedAnyway, allowedAnywaySeeding, blocks>>
+     ELSE IF plannedAction = "resume" THEN
+       /\ running' = TRUE
+       /\ pausedBy' = "none"
+       /\ plannedAction' = "none"
+       /\ planStale' = FALSE
+       /\ UNCHANGED <<phase, userPaused, allowedAnyway, allowedAnywaySeeding, blocks>>
+     ELSE
+       /\ running' = FALSE
+       /\ pausedBy' = plannedAction
+       /\ plannedAction' = "none"
+       /\ planStale' = FALSE
+       /\ UNCHANGED <<phase, userPaused, allowedAnyway, allowedAnywaySeeding, blocks>>
 
 \* Kotlin pushes a rule block (e.g. mobile data, VPN dropped, low battery, schedule, low storage).
 RuleTurnsOn(t) ==
+  /\ plannedAction = "none"
   /\ t \in (AllBlocks \ {"startup"})
   /\ t \notin blocks
   /\ LET nextBlocks == blocks \cup {t}
-         res == Reconcile(pausedBy, nextBlocks, phase, allowedAnyway)
+         act == PlannedOf(running, pausedBy, nextBlocks, phase, allowedAnyway)
      IN /\ blocks' = nextBlocks
-        /\ running' = res.run
-        /\ pausedBy' = res.by
-  /\ UNCHANGED <<phase, userPaused, allowedAnyway, allowedAnywaySeeding>>
+        /\ plannedAction' = act
+        /\ planStale' = FALSE
+  /\ UNCHANGED <<phase, running, userPaused, pausedBy, allowedAnyway, allowedAnywaySeeding>>
 
 \* Kotlin lifts a rule block when the condition clears.
 RuleTurnsOff(t) ==
+  /\ plannedAction = "none"
   /\ t \in blocks
   /\ LET nextBlocks == blocks \ {t}
-         res == Reconcile(pausedBy, nextBlocks, phase, allowedAnyway)
+         act == PlannedOf(running, pausedBy, nextBlocks, phase, allowedAnyway)
      IN /\ blocks' = nextBlocks
-        /\ running' = res.run
-        /\ pausedBy' = res.by
-  /\ UNCHANGED <<phase, userPaused, allowedAnyway, allowedAnywaySeeding>>
+        /\ plannedAction' = act
+        /\ planStale' = FALSE
+  /\ UNCHANGED <<phase, running, userPaused, pausedBy, allowedAnyway, allowedAnywaySeeding>>
 
-\* The user pauses the transfer: clears allowed_anyway and sets paused_by = "user".
+\* The user pauses the transfer: can land even while a tick's plannedAction is waiting to apply!
+\* Bumps user_gen, marking any in-flight plannedAction stale.
 YouPause ==
   /\ ~userPaused
   /\ userPaused' = TRUE
@@ -99,31 +146,34 @@ YouPause ==
   /\ running' = FALSE
   /\ allowedAnyway' = FALSE
   /\ allowedAnywaySeeding' = FALSE
-  /\ UNCHANGED <<phase, blocks>>
+  /\ planStale' = IF plannedAction /= "none" THEN TRUE ELSE planStale
+  /\ UNCHANGED <<phase, blocks, plannedAction>>
 
-\* The user taps Resume (without override): clears user pause and lets the planner decide.
+\* The user taps Resume (without override): clears user pause, bumps user_gen.
 YouResume ==
   /\ userPaused
-  /\ LET res == Reconcile("none", blocks, phase, allowedAnyway)
-     IN /\ userPaused' = FALSE
-        /\ running' = res.run
-        /\ pausedBy' = res.by
-  /\ UNCHANGED <<phase, allowedAnyway, allowedAnywaySeeding, blocks>>
+  /\ userPaused' = FALSE
+  /\ pausedBy' = "none"
+  /\ planStale' = IF plannedAction /= "none" THEN TRUE ELSE planStale
+  /\ UNCHANGED <<phase, running, allowedAnyway, allowedAnywaySeeding, blocks, plannedAction>>
 
-\* The user taps "Resume anyway": sets allowed_anyway (and remembers if already seeding), then runs planner.
+\* The user taps "Resume anyway": sets allowed_anyway (and remembers if already seeding), bumps user_gen.
 YouResumeAnyway ==
   /\ ~running
+  /\ plannedAction = "none"
   /\ LET nextSeeding == (phase = "seeding")
-         res == Reconcile("none", blocks, phase, TRUE)
+         act == PlannedOf(running, "none", blocks, phase, TRUE)
      IN /\ userPaused' = FALSE
+        /\ pausedBy' = "none"
         /\ allowedAnyway' = TRUE
         /\ allowedAnywaySeeding' = nextSeeding
-        /\ running' = res.run
-        /\ pausedBy' = res.by
-  /\ UNCHANGED <<phase, blocks>>
+        /\ plannedAction' = act
+        /\ planStale' = FALSE
+  /\ UNCHANGED <<phase, running, blocks>>
 
 \* A downloading transfer finishes: engine.rs drops allowed_anyway unless granted while already seeding.
 DownloadFinishes ==
+  /\ plannedAction = "none"
   /\ phase = "downloading"
   /\ running
   /\ LET nextExempt == IF DESIGN = "overrideLeaksToSeeding" THEN allowedAnyway
@@ -134,19 +184,22 @@ DownloadFinishes ==
         /\ allowedAnyway' = nextExempt
         /\ running' = res.run
         /\ pausedBy' = res.by
-  /\ UNCHANGED <<userPaused, allowedAnywaySeeding, blocks>>
+  /\ UNCHANGED <<userPaused, allowedAnywaySeeding, blocks, plannedAction, planStale>>
 
 \* Engine restarts: nativeInit holds every transfer with "startup" until Kotlin evaluates governance.
 EngineRestarts ==
+  /\ plannedAction = "none"
   /\ "startup" \notin blocks
   /\ LET nextBlocks == blocks \cup {"startup"}
          res == Reconcile(pausedBy, nextBlocks, phase, allowedAnyway)
      IN /\ blocks' = nextBlocks
         /\ running' = res.run
         /\ pausedBy' = res.by
-  /\ UNCHANGED <<phase, userPaused, allowedAnyway, allowedAnywaySeeding>>
+  /\ UNCHANGED <<phase, userPaused, allowedAnyway, allowedAnywaySeeding, plannedAction, planStale>>
 
 Next ==
+  \/ TickPlan
+  \/ TickApply
   \/ \E t \in (AllBlocks \ {"startup"}) : RuleTurnsOn(t)
   \/ \E t \in AllBlocks : RuleTurnsOff(t)
   \/ YouPause
@@ -164,19 +217,23 @@ UserPauseStaysPaused ==
   userPaused => (~running /\ ~allowedAnyway)
 
 \* Safety and physical rules (VPN, low storage while downloading, startup hold) always stop
-\* the transfer, even if the user tapped "Resume anyway".
+\* the transfer once the pending tick has applied, even if the user tapped "Resume anyway".
 SafetyRulesAlwaysHold ==
-  ( "vpn_required" \in blocks
+  (plannedAction = "none" /\ (
+    "vpn_required" \in blocks
     \/ ("storage_full" \in blocks /\ phase = "downloading")
-    \/ "startup" \in blocks ) => ~running
+    \/ "startup" \in blocks )) => ~running
 
 \* A "Resume anyway" tapped during a download never leaks into seeding on a metered link.
 NoSeedLeak ==
-  (phase = "seeding" /\ ~allowedAnywaySeeding /\ ("seed_metered" \in blocks \/ "wifi_only" \in blocks))
+  (plannedAction = "none" /\ phase = "seeding" /\ ~allowedAnywaySeeding
+    /\ ("seed_metered" \in blocks \/ "wifi_only" \in blocks))
     => ~running
 
-\* When the user didn't pause it and no active rule applies, the transfer is never stuck with a stale tag.
+\* When no tick is mid-flight, the user didn't pause it, and no active rule applies,
+\* the transfer is never stuck with a stale rule tag once the tick runs.
 NoStuckRuleTag ==
-  (~userPaused /\ BlockingTag(blocks, phase, allowedAnyway) = "none")
+  (plannedAction = "none" /\ ~userPaused /\ BlockingTag(blocks, phase, allowedAnyway) = "none"
+    /\ PlannedOf(running, pausedBy, blocks, phase, allowedAnyway) = "none")
     => (running /\ pausedBy = "none")
 =============================================================================

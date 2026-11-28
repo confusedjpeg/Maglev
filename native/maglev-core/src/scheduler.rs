@@ -310,6 +310,17 @@ pub enum Action {
     Resume { id: String },
 }
 
+impl Action {
+    pub fn id(&self) -> &str {
+        match self {
+            Action::Pause { id, .. }
+            | Action::Queue { id }
+            | Action::Park { id }
+            | Action::Resume { id } => id,
+        }
+    }
+}
+
 fn seed_limit_hit(f: &TorrentFacts, cfg: &SchedulerConfig) -> bool {
     if !f.finished || f.limits_waived {
         return false;

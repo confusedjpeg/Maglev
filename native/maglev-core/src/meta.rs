@@ -67,6 +67,9 @@ pub struct TorrentMeta {
     /// (a fast-resumed torrent can go live without a check that would reset it).
     #[serde(skip)]
     pub stalled_since_ms: Option<i64>,
+    /// Bumped on every user pause/resume so an in-flight scheduler tick never overwrites a newer user action.
+    #[serde(skip)]
+    pub user_gen: u64,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
