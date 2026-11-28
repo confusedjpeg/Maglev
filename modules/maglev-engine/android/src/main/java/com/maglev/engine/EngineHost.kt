@@ -1109,7 +1109,12 @@ object EngineHost {
         if (!isOk(list)) return list
         var n = 0
         for (t in Json.list(list["torrents"])) {
-            if ((t["state"] as? String) in setOf("DOWNLOADING", "SEEDING", "QUEUED", "INITIALIZING")) {
+            val st = t["state"] as? String
+            val by = t["paused_by"] as? String
+            // A torrent paused by a governance rule or schedule is held too, so it can't restart by itself
+            // or keep service_wanted set when the rule clears. Leave user-paused, seed-limit, and health-held torrents alone.
+            val heldByRule = st == "PAUSED" && by != null && by != "user" && by != "seed_limit" && by != "health" && t["health"] == null
+            if (st in setOf("DOWNLOADING", "SEEDING", "QUEUED", "INITIALIZING") || heldByRule) {
                 val id = t["id"] as? String ?: continue
                 if (isOk(call { NativeCore.nativePause(id) })) n++
             }

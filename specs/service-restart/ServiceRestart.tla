@@ -14,27 +14,29 @@
    and no orphan foreground service stays up without an engine. *)
 
 CONSTANTS
-  DESIGN  \* "fixed", "holdClearsPaused", "noEpochGuard", or "noIntentFlags"
+  DESIGN  \* "fixed", "holdClearsPaused", "skipRulePaused", "noEpochGuard", or "noIntentFlags"
 
 VARIABLES
-  process,        \* "alive" or "dead"
-  app,            \* "front", "back" or "closed"
-  engine,         \* "stopped" or "running" (EngineHost.initialized)
-  service,        \* "stopped" or "foreground" (MaglevTorrentService)
-  hasActive,      \* persisted: any downloading / seeding / queued / resolving transfer
-  hasRulePaused,  \* persisted: any transfer paused by a governance rule (Wi-Fi, VPN, battery, offline, ...)
-  hasUserPaused,  \* persisted: any transfer paused by the user
-  hasSchedPaused, \* persisted: any transfer paused by the schedule
-  wanted,         \* persisted KEY_WANTED (service_wanted)
-  userShutdown,   \* persisted KEY_USER_SHUTDOWN (user_shutdown)
-  userPausedAll,  \* persisted KEY_USER_PAUSED_ALL (user_paused_all)
-  scheduleHeld,   \* persisted ScheduleManager.isHeld
-  holdForPaused,  \* in-memory EngineHost.holdForPaused
-  queuedHeadless  \* pending headlessStart coroutine: "none", "fresh", "stale"
+  process,         \* "alive" or "dead"
+  app,             \* "front", "back" or "closed"
+  engine,          \* "stopped" or "running" (EngineHost.initialized)
+  service,         \* "stopped" or "foreground" (MaglevTorrentService)
+  hasActive,       \* persisted: any downloading / seeding / queued / resolving transfer
+  hasRulePaused,   \* persisted: any transfer paused by a governance rule (Wi-Fi, VPN, battery, offline, ...)
+  hasUserPaused,   \* persisted: any transfer paused by the user
+  hasSchedPaused,  \* persisted: any transfer paused by the schedule
+  wanted,          \* persisted KEY_WANTED (service_wanted)
+  userShutdown,    \* persisted KEY_USER_SHUTDOWN (user_shutdown)
+  userPausedAll,   \* persisted KEY_USER_PAUSED_ALL (user_paused_all)
+  scheduleHeld,    \* persisted ScheduleManager.isHeld
+  holdForPaused,   \* in-memory EngineHost.holdForPaused
+  queuedHeadless,  \* pending headlessStart coroutine: "none", "fresh", "stale"
+  pausedAllIntent  \* ghost: user tapped Pause all and has not added or resumed work since
 
 vars == <<process, app, engine, service, hasActive, hasRulePaused,
           hasUserPaused, hasSchedPaused, wanted, userShutdown,
-          userPausedAll, scheduleHeld, holdForPaused, queuedHeadless>>
+          userPausedAll, scheduleHeld, holdForPaused, queuedHeadless,
+          pausedAllIntent>>
 
 TypeOK ==
   /\ process \in {"alive", "dead"}
@@ -51,6 +53,7 @@ TypeOK ==
   /\ scheduleHeld \in BOOLEAN
   /\ holdForPaused \in BOOLEAN
   /\ queuedHeadless \in {"none", "fresh", "stale"}
+  /\ pausedAllIntent \in BOOLEAN
 
 RealWork == hasActive \/ hasRulePaused
 
@@ -69,6 +72,7 @@ Init ==
   /\ scheduleHeld = FALSE
   /\ holdForPaused = FALSE
   /\ queuedHeadless = "none"
+  /\ pausedAllIntent = FALSE
 
 \* The user adds a transfer or resumes one in the app (setWanted(true) clears stop flags).
 YouAddWork ==
@@ -83,6 +87,7 @@ YouAddWork ==
   /\ userPausedAll' = FALSE
   /\ scheduleHeld' = FALSE
   /\ holdForPaused' = FALSE
+  /\ pausedAllIntent' = FALSE
   /\ UNCHANGED <<process, app, hasRulePaused, hasUserPaused, hasSchedPaused, queuedHeadless>>
 
 \* All active transfers finish while the engine is running.
@@ -102,7 +107,7 @@ WorkFinishes ==
                       ELSE "stopped"
         /\ holdForPaused' = nextHold
   /\ UNCHANGED <<process, app, engine, hasRulePaused, hasUserPaused, hasSchedPaused,
-                 userShutdown, userPausedAll, scheduleHeld, queuedHeadless>>
+                 userShutdown, userPausedAll, scheduleHeld, queuedHeadless, pausedAllIntent>>
 
 \* A governance rule (Wi-Fi only, VPN, battery, offline) pauses active work.
 \* Rule-paused transfers still count as real work so the service stays up to auto-resume.
@@ -114,7 +119,8 @@ RulePausesWork ==
   /\ hasActive' = FALSE
   /\ hasRulePaused' = TRUE
   /\ UNCHANGED <<process, app, engine, service, hasUserPaused, hasSchedPaused,
-                 wanted, userShutdown, userPausedAll, scheduleHeld, holdForPaused, queuedHeadless>>
+                 wanted, userShutdown, userPausedAll, scheduleHeld, holdForPaused,
+                 queuedHeadless, pausedAllIntent>>
 
 \* The blocking governance rule clears and rule-paused work resumes.
 RuleClearsWork ==
@@ -124,7 +130,8 @@ RuleClearsWork ==
   /\ hasRulePaused' = FALSE
   /\ hasActive' = TRUE
   /\ UNCHANGED <<process, app, engine, service, hasUserPaused, hasSchedPaused,
-                 wanted, userShutdown, userPausedAll, scheduleHeld, holdForPaused, queuedHeadless>>
+                 wanted, userShutdown, userPausedAll, scheduleHeld, holdForPaused,
+                 queuedHeadless, pausedAllIntent>>
 
 \* The user leaves Maglev for the home screen or another app.
 YouGoHome ==
@@ -133,7 +140,7 @@ YouGoHome ==
   /\ app' = "back"
   /\ UNCHANGED <<process, engine, service, hasActive, hasRulePaused, hasUserPaused,
                  hasSchedPaused, wanted, userShutdown, userPausedAll, scheduleHeld,
-                 holdForPaused, queuedHeadless>>
+                 holdForPaused, queuedHeadless, pausedAllIntent>>
 
 \* The user opens Maglev: EngineHost.init starts the engine and onForeground drops holdForPaused.
 \* Opening the app does NOT clear user_shutdown (only setWanted(true) when real work exists does).
@@ -147,25 +154,31 @@ YouOpenApp ==
                 ELSE IF queuedHeadless /= "none" THEN service
                 ELSE "stopped"
   /\ UNCHANGED <<hasActive, hasRulePaused, hasUserPaused, hasSchedPaused,
-                 wanted, userShutdown, userPausedAll, scheduleHeld, queuedHeadless>>
+                 wanted, userShutdown, userPausedAll, scheduleHeld, queuedHeadless,
+                 pausedAllIntent>>
 
 \* The user taps "Pause all" on the foreground notification or Quick Settings tile.
 \* The momentary sticky-restart placeholder (engine = "stopped") has no Pause all button;
 \* after process death without shutdown, engineReadyForAction starts the engine first.
+\* In the fixed design, rule-paused and schedule-paused transfers are held too (issue #275).
 YouPauseAllFromNotification ==
   /\ ((process = "alive" /\ service = "foreground" /\ engine = "running")
       \/ (process = "dead" /\ ~userShutdown))
-  /\ hasActive
+  /\ (hasActive \/ (DESIGN /= "skipRulePaused" /\ (hasRulePaused \/ hasSchedPaused)))
   /\ process' = "alive"
   /\ app' = IF process = "dead" THEN "closed" ELSE app
   /\ engine' = "running"
   /\ service' = "foreground"
   /\ hasActive' = FALSE
+  /\ hasRulePaused' = IF DESIGN = "skipRulePaused" THEN hasRulePaused ELSE FALSE
+  /\ hasSchedPaused' = IF DESIGN = "skipRulePaused" THEN hasSchedPaused ELSE FALSE
+  /\ scheduleHeld' = IF DESIGN = "skipRulePaused" THEN scheduleHeld ELSE FALSE
   /\ hasUserPaused' = TRUE
   /\ wanted' = FALSE
   /\ userPausedAll' = TRUE
   /\ holdForPaused' = TRUE
-  /\ UNCHANGED <<hasRulePaused, hasSchedPaused, userShutdown, scheduleHeld, queuedHeadless>>
+  /\ pausedAllIntent' = TRUE
+  /\ UNCHANGED <<userShutdown, queuedHeadless>>
 
 \* The user taps "Resume all" on the foreground notification or Quick Settings tile.
 \* After process death, engineReadyForAction starts the engine first; poll then calls setWanted(true).
@@ -184,6 +197,7 @@ YouResumeAllFromNotification ==
   /\ userShutdown' = FALSE
   /\ scheduleHeld' = FALSE
   /\ holdForPaused' = FALSE
+  /\ pausedAllIntent' = FALSE
   /\ UNCHANGED <<hasRulePaused, hasSchedPaused, queuedHeadless>>
 
 \* The 1 s telemetry poll calls EngineHost.driveService(summary).
@@ -205,7 +219,7 @@ PollAndDriveService ==
                       ELSE "stopped"
         /\ holdForPaused' = IF ~hasActive /\ ~hasUserPaused THEN FALSE ELSE holdForPaused
   /\ UNCHANGED <<process, app, engine, hasActive, hasRulePaused, hasUserPaused,
-                 hasSchedPaused, queuedHeadless>>
+                 hasSchedPaused, queuedHeadless, pausedAllIntent>>
 
 \* The schedule window closes and the 10 s grace expires: pause active work, persist scheduleHeld,
 \* and stop the service if no rule-paused work or notification hold keeps it up.
@@ -222,7 +236,7 @@ SchedulePauses ==
   /\ service' = "stopped"
   /\ holdForPaused' = FALSE
   /\ UNCHANGED <<process, app, engine, hasRulePaused, hasUserPaused,
-                 userShutdown, userPausedAll, queuedHeadless>>
+                 userShutdown, userPausedAll, queuedHeadless, pausedAllIntent>>
 
 \* The schedule alarm fires (ACTION_SCHEDULE_RESUME): clear scheduleHeld and queue headlessStart.
 ScheduleWindowOpens ==
@@ -236,7 +250,7 @@ ScheduleWindowOpens ==
   /\ hasActive' = TRUE
   /\ queuedHeadless' = "fresh"
   /\ UNCHANGED <<engine, hasRulePaused, hasUserPaused, wanted, userShutdown,
-                 userPausedAll, holdForPaused>>
+                 userPausedAll, holdForPaused, pausedAllIntent>>
 
 \* The user taps "Shut down" on the notification: bump shutdownEpoch, stop engine and service,
 \* close the app task (finishAppTasks), and persist user_shutdown.
@@ -251,7 +265,7 @@ YouShutdown ==
   /\ holdForPaused' = FALSE
   /\ queuedHeadless' = IF queuedHeadless = "fresh" THEN "stale" ELSE queuedHeadless
   /\ UNCHANGED <<process, hasActive, hasRulePaused, hasUserPaused, hasSchedPaused,
-                 userPausedAll, scheduleHeld>>
+                 userPausedAll, scheduleHeld, pausedAllIntent>>
 
 \* Android kills the process while Maglev is not in front. All in-memory state is lost.
 AndroidKillsProcess ==
@@ -264,7 +278,7 @@ AndroidKillsProcess ==
   /\ holdForPaused' = FALSE
   /\ queuedHeadless' = "none"
   /\ UNCHANGED <<hasActive, hasRulePaused, hasUserPaused, hasSchedPaused,
-                 wanted, userShutdown, userPausedAll, scheduleHeld>>
+                 wanted, userShutdown, userPausedAll, scheduleHeld, pausedAllIntent>>
 
 \* Android restarts the START_STICKY service with a null intent: enterForeground, then queue headlessStart.
 AndroidStickyRestart ==
@@ -274,7 +288,8 @@ AndroidStickyRestart ==
   /\ service' = "foreground"
   /\ queuedHeadless' = "fresh"
   /\ UNCHANGED <<engine, hasActive, hasRulePaused, hasUserPaused, hasSchedPaused,
-                 wanted, userShutdown, userPausedAll, scheduleHeld, holdForPaused>>
+                 wanted, userShutdown, userPausedAll, scheduleHeld, holdForPaused,
+                 pausedAllIntent>>
 
 \* The queued EngineHost.headlessStartLocked coroutine acquires lifecycleLock and runs.
 RunQueuedHeadless ==
@@ -286,7 +301,7 @@ RunQueuedHeadless ==
        /\ queuedHeadless' = "none"
        /\ UNCHANGED <<process, app, engine, hasActive, hasRulePaused, hasUserPaused,
                       hasSchedPaused, wanted, userShutdown, userPausedAll,
-                      scheduleHeld, holdForPaused>>
+                      scheduleHeld, holdForPaused, pausedAllIntent>>
      ELSE IF queuedHeadless = "stale" /\ DESIGN = "noEpochGuard" THEN
        \* Rejected design: without the shutdownEpoch guard, the stale start brings the engine back.
        /\ engine' = "running"
@@ -294,7 +309,7 @@ RunQueuedHeadless ==
        /\ queuedHeadless' = "none"
        /\ UNCHANGED <<process, app, hasActive, hasRulePaused, hasUserPaused,
                       hasSchedPaused, wanted, userShutdown, userPausedAll,
-                      scheduleHeld, holdForPaused>>
+                      scheduleHeld, holdForPaused, pausedAllIntent>>
      ELSE
        LET allow == IF DESIGN = "noIntentFlags"
                     THEN (hasActive \/ hasRulePaused \/ hasUserPaused \/ hasSchedPaused)
@@ -305,7 +320,7 @@ RunQueuedHeadless ==
             /\ queuedHeadless' = "none"
             /\ UNCHANGED <<process, app, engine, hasActive, hasRulePaused, hasUserPaused,
                            hasSchedPaused, wanted, userShutdown, userPausedAll,
-                           scheduleHeld, holdForPaused>>
+                           scheduleHeld, holdForPaused, pausedAllIntent>>
           ELSE
             \* Start the engine, then keep the service only if active, rule-paused, or schedule-paused work exists.
             /\ engine' = "running"
@@ -314,7 +329,7 @@ RunQueuedHeadless ==
             /\ queuedHeadless' = "none"
             /\ UNCHANGED <<process, app, hasActive, hasRulePaused, hasUserPaused,
                            hasSchedPaused, userShutdown, userPausedAll,
-                           scheduleHeld, holdForPaused>>
+                           scheduleHeld, holdForPaused, pausedAllIntent>>
 
 Next ==
   \/ YouAddWork
@@ -361,6 +376,11 @@ PausedAllStaysStopped ==
 ScheduleHoldStopsService ==
   (scheduleHeld /\ ~RealWork /\ ~(holdForPaused /\ hasUserPaused)) =>
     (queuedHeadless = "none" => service = "stopped")
+
+\* After the user taps Pause all, nothing starts running (even when a rule or schedule clears)
+\* until the user adds or resumes work again.
+PauseAllHoldsEverything ==
+  pausedAllIntent => ~hasActive
 
 \* The foreground service never stays up with no running engine once any queued start has finished.
 NoOrphanService ==

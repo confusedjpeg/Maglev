@@ -223,6 +223,10 @@ globalThis.__fake = { Platform: { OS: 'android' }, native };
   const drive = fnBody(host, 'private fun driveService(');
   ok('driveService does not treat holdForPaused as wanted (keeps user_paused_all intact)',
     /val realWork\s*=/.test(drive) && /setWanted\(c,\s*realWork\s*\|\|\s*s\.pausedBySchedule\s*>\s*0\)/.test(drive));
+  const pauseAll = fnBody(host, 'fun pauseAll(');
+  ok('pauseAll also holds rule-paused and schedule-paused torrents (keeps seed_limit and health untouched)',
+    /val heldByRule\s*=\s*st == "PAUSED"[\s\S]*?by != "user"[\s\S]*?by != "seed_limit"[\s\S]*?by != "health"[\s\S]*?t\["health"\] == null/.test(pauseAll) &&
+    /\|\|\s*heldByRule/.test(pauseAll));
 
   // Notification actions follow the service (contract 8.2).
   const notif = fs.readFileSync(path.join(dir, 'service/Notifications.kt'), 'utf8');
